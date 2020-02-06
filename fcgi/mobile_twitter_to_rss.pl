@@ -4,6 +4,8 @@ use warnings;
 use utf8;
 use 5.10.0;
 use Data::Dumper;
+use DateTime;
+use DateTime::Format::Strptime;
 use Readonly;
 use HTML::TreeBuilder::XPath;
 use HTML::TreeBuilder::LibXML;
@@ -20,21 +22,11 @@ binmode STDIN, 'utf8';
 
 HTML::TreeBuilder::LibXML->replace_original();
 
-Readonly my $BASEURL    => 'https://twitter.com';
-
-my $URL = $ENV{'OWN_BASEURL_USER'};
-if ( not defined $URL ) {
-  $URL = 'http://twitrss.me/twitter_user_to_rss';
-}
-Readonly my $OWNBASEURL => $URL;
-
+Readonly my $BASEURL    => 'https://mobile.twitter.com';
+Readonly my $OWNBASEURL => 'http://twitrss.me/twitter_user_to_rss';
 my $browser = LWP::UserAgent->new;
-$browser->agent('Opera/9.80 (Windows NT 6.1; WOW64) Presto/2.12.388 Version/12.18');
-
-# From http://lwp.interglacial.com/ch11_01.htm#perllwp-CHP-11-SECT-1
-# Enables cookies
-$browser->cookie_jar( {} );
-
+$browser->agent('Mozilla/5.0');# (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36');
+$browser->default_header('Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8');
 $browser->conn_cache(LWP::ConnCache->new(5));
 $browser->timeout(2);
 
@@ -72,9 +64,8 @@ while (my $q = CGI::Fast->new) {
   my $url = "$BASEURL/$user";
   $url .= "/with_replies" if $replies;
 
-  # Clear cookies before every request.
-  $browser->cookie_jar( {} );
   my $response = $browser->get($url);
+  # say Dumper $response;
   unless ($response->is_success) {
     err('Can&#8217;t screenscrape Twitter',404);
     next;
@@ -87,29 +78,26 @@ while (my $q = CGI::Fast->new) {
   my $tree= HTML::TreeBuilder::XPath->new;
   $tree->parse($content);
 
-  my $feedavatar = $tree->findvalue('//img' . class_contains("ProfileAvatar-image") . "/\@src");
+  my $feedavatar = $tree->findvalue('//table' . class_contains("profile-details") . '/tr/td' . class_contains("avatar") .'/img/@src');
 
   # Get capitalization from Twitter page
-  my $normalizedName = $tree->findvalue('//a' . class_contains("ProfileHeaderCard-screennameLink") . "/\@href");
-  $normalizedName =~ s{^/}{};
-  $user = $normalizedName;
+  my $normalizedName = $tree->findvalue('//div' . class_contains("fullname"));
 
-  my $tweets = $tree->findnodes( '//li' . class_contains('js-stream-item')); # new version 2015-06-02
+  my $tweets = $tree->findnodes( '//table' . class_contains('tweet'));
 
   if ($tweets) {
-    for my $li (@$tweets) {    
-      my $tweet = $li->findnodes('./div' 
-                                  . class_contains("js-stream-tweet") 
-                                )->[0]
-      ;
+    for my $tweet (@$tweets) {
       next unless $tweet;
-      # die $tweet->as_HTML;
-      my $header = $tweet->findnodes('./div/div' 
-                                     . class_contains("stream-item-header") 
-                                     . "/a" 
-                                     . class_contains("js-action-profile"))->[0];
-      my $bd   = $tweet->findnodes( './div/div/p' 
-                                     . class_contains("js-tweet-text")
+      my $header = $tweet->findnodes('./tr' 
+                                     . class_contains("tweet-header") 
+                                     )->[0];
+      my $bd   = $tweet->findnodes( './tr' 
+                                     . class_contains("tweet-container")
+                                     . '/td'
+                                     . class_contains("tweet-content")
+                                     . '/div'
+                                     . class_contains("tweet-text")
+                                     . '/div'
                                      )->[0];
       my $body = "<![CDATA[" . encode_entities($bd->as_HTML,'^\n\x20-\x25\x27-\x7e"') . "]]>";
       $body=~s{&amp;(\w+);}{&$1;}gi;
@@ -122,60 +110,68 @@ while (my $q = CGI::Fast->new) {
       $body=~s{target="_blank"}{}gi;
       $body=~s{</?s[^>]*>}{}gi;
       $body=~s{data-[\w\-]+="[^"]+"}{}gi; # validator doesn't like data-aria markup that we get from twitter
-      $body=~s{<img.*?alt="(.+?)"[^>]*>}{$1}gi;
-      my $avatar = $header->findvalue('./img' . class_contains("avatar") . "/\@src"); 
-      my @fst_img_a = $tweet->findnodes( './div//div'
-                                       . class_contains("js-adaptive-photo")
-                                       );
-      ## Need a test case for old media
-      @fst_img_a = $tweet->findnodes( './div/div'
-                                    . class_contains("OldMedia")
-                                    . "/div/div") unless @fst_img_a;
-
-      my $fst_img="";
-      foreach my $img_a (@fst_img_a) {
-        if($img_a) {
-          $fst_img = $img_a->findvalue('@data-image-url');
-          if($fst_img) {
-            $body=~s{\]\]>$}{" <img src=\"$fst_img\" width=\"250\" />\]\]>"}e;
-          }
-        }
-      }
-      my $video = $tweet->findnodes('./div//div'
-                                    . class_contains("PlayableMedia-player")
-                                   )->[0];
-      if($video) {
-        $video = $video->findvalues('@style')->[0]; # url of video is derived from the background image used as placeholder
-        $video =~ s{[^']+'([^']+)'\)}{$1};
-        if ($video =~ m{tweet_video} ) {
-          $video =~ s{https://pbs.twimg.com/tweet_video_thumb/([a-zA-Z0-9_]+).jpg}{https://video.twimg.com/tweet_video/$1.mp4};
-          $body =~ s{\]\]>$}{" <video src=\"$video\" width=\"250\" loop>Your browser does not support the video tag.</video>\]\]>"}e;
-        }
-#        elsif ($video =~ m{ext_tw}) {
-#          # TODO : cannot deal with these videos, so do nothing for now
-#          # the url is requested by JS code and need authentication
-#        }
-      }
-
-      my $fullname = $header->findvalue('./strong' . class_contains("fullname"));
-      my $username = $header->findvalue('./span' . class_contains("username"));
+      my $avatar = $header->findvalue('./td' . class_contains("avatar") . "/a/img/\@src"); 
+      my $fst_img_a = ""; #$tweet->findnodes( './a' 
+      my $fst_img=""; # TODO: There's no easy way to pull media in a single request to the profile page
+      my $fullname = $header->findvalue('./td' . class_contains('user-info') . '/a/strong' . class_contains("fullname"));
+      my $username = $header->findvalue('./td' . class_contains('user-info') . '/a/div' . class_contains("username"));
       $username =~ s{<[^>]+>}{}g;
       $username =~ s{^\s+}{};
       $username =~ s{\s+$}{};
-      foreach my $img ($bd->findnodes('.//img')) {
-       $img->replace_with($img->attr('alt'));
-      }
       my $title = enctxt($bd->as_text);
       $title=~s{&nbsp;}{}gi;
       $title=~s{http}{ http}; # links in title lose space
-      my $uri = $BASEURL . $tweet->findvalue('@data-permalink-path');  
-      my $timestamp = $tweet->findnodes('./div/div'
-                      . class_contains("stream-item-header")
-                      . '/small/a' 
-                      . class_contains("tweet-timestamp"))->[0]->findvalue('./span/@data-time'
-      );  
+      my $uri = $BASEURL . $tweet->findvalue('@href');
+      # Limitation: actual timestamps not present in the feed, we have to work out the best we can from the approximate versions given.
+      my $timestamp = $header->findvalue('./td'
+                      . class_contains("timestamp")
+                      . '/a')
+      ;
+      my $dt = DateTime->from_epoch( epoch => time());
+      if($timestamp =~ m{^\d+h}) {  # XXh == this number of hours ago
+        my $hours_ago = $timestamp;
+        $hours_ago =~ s{[^\d]}{}g;
+        my $now = time();
+        my $then = $now - $hours_ago * 3600;
+        $dt = DateTime->from_epoch( epoch => $then);
+      }
+      elsif($timestamp =~ m{^\d+m}) { # XXm == this num minutes
+        my $mins_ago = $timestamp;
+        $mins_ago =~ s{[^\d]}{}g;
+        my $now = time();
+        my $then = $now - $mins_ago * 60;
+        $dt = DateTime->from_epoch( epoch => $then);
+      }
+      elsif($timestamp =~ m{^\d+ \w{3} \d+$}) {
+        my $strp = DateTime::Format::Strptime->new(
+          pattern => "%d %b %y"
+        );
+        $dt = $strp->parse_datetime($timestamp);
+      }
+      else {
+        #  We hope that this is XX Mon, now we need to work out which year.
+        #  We assume that anything where the month is after the current one must have been last year
+        #  In all other cases it will be the current year.
+        my $curr_year = $dt->year;
+        my $curr_mon  = $dt->month;
 
-      my $pub_date = strftime("%a, %d %b %Y %H:%M:%S %z", localtime($timestamp));
+        my $strp = DateTime::Format::Strptime->new(
+          pattern => "%b %d"
+        );
+        $dt = $strp->parse_datetime($timestamp);
+
+        unless ($dt) {
+          die "dodgy date: '$timestamp'";
+        }
+        if($dt->month <= $curr_mon) { # month <= current, year is this year
+          $dt->set(year => $curr_year);
+        }
+        else { # year is last year
+          $dt->set(year => $curr_year - 1);
+        }
+      }
+      # my $pub_date = strftime("%a, %d %b %Y %H:%M:%S %z", localtime($timestamp));
+      my $pub_date = $dt->strftime("%a, %d %b %Y %H:%M:%S %z");
 
       push @items, {
         username => enctxt($username),
