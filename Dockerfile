@@ -33,8 +33,6 @@ RUN apt-get update \
  && ln -sf /dev/stderr /var/log/apache2/twitrssme.error.log \
  && ln -sf /dev/stderr /var/log/apache2/error.log
 
-RUN rm -f /run/apache2/apache2.pid
-
-CMD [ "apachectl", "-D", "FOREGROUND" ]
+CMD rm -f /run/apache2/apache2.pid; exec apachectl -D FOREGROUND
 
 EXPOSE 80
